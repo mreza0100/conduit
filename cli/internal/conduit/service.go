@@ -111,17 +111,59 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	// Initialize country filter if configured
+	fmt.Println("")
+	fmt.Println("╔════════════════════════════════════════════════════════════════╗")
+	fmt.Println("║           SERVICE CONFIGURATION                                ║")
+	fmt.Println("╚════════════════════════════════════════════════════════════════╝")
+	fmt.Printf("[SERVICE-INIT] Data directory: %s\n", s.config.DataDir)
+	fmt.Printf("[SERVICE-INIT] Max clients: %d\n", s.config.MaxClients)
+	fmt.Printf("[SERVICE-INIT] Bandwidth limit: %d bytes/sec\n", s.config.BandwidthBytesPerSecond)
+	fmt.Printf("[SERVICE-INIT] Verbosity level: %d\n", s.config.Verbosity)
+	fmt.Printf("[SERVICE-INIT] Allowed countries config: %v\n", s.config.AllowedCountries)
+	fmt.Printf("[SERVICE-INIT] Number of allowed countries: %d\n", len(s.config.AllowedCountries))
+	fmt.Println("")
+
 	if len(s.config.AllowedCountries) > 0 {
+		fmt.Println("[SERVICE-INIT] Country filtering is ENABLED")
+		fmt.Printf("[SERVICE-INIT] Will only allow connections from: %v\n", s.config.AllowedCountries)
+
 		dbPath := s.config.DataDir + "/GeoLite2-Country.mmdb"
+		fmt.Printf("[SERVICE-INIT] Ensuring GeoIP database exists at: %s\n", dbPath)
+
 		if err := geo.EnsureDatabase(dbPath); err != nil {
 			return fmt.Errorf("failed to ensure GeoIP database for filter: %w", err)
 		}
+		fmt.Println("[SERVICE-INIT] GeoIP database ready")
+
 		cf, err := filter.NewCountryFilter(dbPath, s.config.AllowedCountries)
 		if err != nil {
 			return fmt.Errorf("failed to create country filter: %w", err)
 		}
 		s.countryFilter = cf
 		fmt.Printf("[FILTER] Only allowing connections from: %v\n", s.config.AllowedCountries)
+
+		// Start periodic stats logger
+		go func() {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			startTime := time.Now()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					allowed, blocked, relay := s.countryFilter.GetStats()
+					uptime := time.Since(startTime).Round(time.Second)
+					fmt.Printf("[FILTER-STATS] Uptime: %s | Allowed: %d | Blocked: %d | Relay: %d | Total attempts: %d\n",
+						uptime, allowed, blocked, relay, allowed+blocked+relay)
+					if allowed+blocked+relay == 0 {
+						fmt.Println("[FILTER-STATS] No connection attempts yet - waiting for Psiphon broker to send clients...")
+					}
+				}
+			}
+		}()
+	} else {
+		fmt.Println("[SERVICE-INIT] Country filtering is DISABLED - all connections will be allowed")
 	}
 
 	if s.metrics != nil && s.config.MetricsAddr != "" {
@@ -260,59 +302,90 @@ func (s *Service) createPsiphonConfig() (*psiphon.Config, error) {
 	}
 
 	// Set up connection callbacks for filtering and/or geo tracking
-	if s.countryFilter != nil || s.geoCollector != nil {
-		psiphonConfig.OnInproxyConnectionEstablished = func(local, remote inproxy.ConnectionStats) {
-			if remote.IP == "" {
+	// ALWAYS set up callbacks to log ALL connection attempts
+	fmt.Println("[SERVICE-DEBUG] Setting up OnInproxyConnectionEstablished callback")
+	fmt.Println("[SERVICE-DEBUG] Setting up OnInproxyConnectionClosed callback")
+	fmt.Printf("[SERVICE-DEBUG] countryFilter enabled: %v, geoCollector enabled: %v\n", s.countryFilter != nil, s.geoCollector != nil)
+
+	psiphonConfig.OnInproxyConnectionEstablished = func(local, remote inproxy.ConnectionStats) {
+		timestamp := time.Now().Format("2006-01-02 15:04:05")
+		fmt.Printf("\n%s [CONNECTION] ========== NEW CONNECTION ATTEMPT ==========\n", timestamp)
+		fmt.Printf("%s [CONNECTION] Local  - IP: %s, Port: %d, Type: %s\n", timestamp, local.IP, local.Port, local.CandidateType)
+		fmt.Printf("%s [CONNECTION] Remote - IP: %s, Port: %d, Type: %s\n", timestamp, remote.IP, remote.Port, remote.CandidateType)
+
+		if remote.IP == "" {
+			fmt.Printf("%s [CONNECTION] WARNING: Remote IP is empty, skipping\n", timestamp)
+			return
+		}
+
+		// Check country filter first (if enabled)
+		if s.countryFilter != nil {
+			fmt.Printf("%s [CONNECTION] Checking country filter for IP: %s\n", timestamp, remote.IP)
+			allowed, countryCode, isRelay := s.countryFilter.IsAllowed(remote.IP)
+			if !allowed {
+				fmt.Printf("%s [CONNECTION] >>> BLOCKED <<< Connection from %s (%s)\n", timestamp, remote.IP, countryCode)
 				return
 			}
+			if isRelay {
+				fmt.Printf("%s [CONNECTION] >>> ALLOWED <<< Relay connection from %s\n", timestamp, remote.IP)
+			} else {
+				fmt.Printf("%s [CONNECTION] >>> ALLOWED <<< Connection from %s (%s)\n", timestamp, remote.IP, countryCode)
+			}
+		} else {
+			fmt.Printf("%s [CONNECTION] No country filter active, allowing connection from %s\n", timestamp, remote.IP)
+		}
 
-			// Check country filter first (if enabled)
+		// Geo tracking (if enabled)
+		if s.geoCollector != nil {
+			if remote.CandidateType == "relay" {
+				s.geoCollector.ConnectRelay(remote.IP)
+				fmt.Printf("%s [CONNECTION] Geo tracking: recorded relay connection\n", timestamp)
+			} else {
+				s.geoCollector.ConnectIP(remote.IP)
+				fmt.Printf("%s [CONNECTION] Geo tracking: recorded direct connection\n", timestamp)
+			}
+		}
+		fmt.Printf("%s [CONNECTION] ========== CONNECTION ESTABLISHED ==========\n\n", timestamp)
+	}
+
+	psiphonConfig.OnInproxyConnectionClosed = func(remote *inproxy.ConnectionStats, bw *inproxy.BandwidthStats) {
+		timestamp := time.Now().Format("2006-01-02 15:04:05")
+		fmt.Printf("\n%s [DISCONNECT] ========== CONNECTION CLOSED ==========\n", timestamp)
+
+		if remote == nil {
+			fmt.Printf("%s [DISCONNECT] WARNING: remote is nil\n", timestamp)
+			return
+		}
+		if remote.IP == "" {
+			fmt.Printf("%s [DISCONNECT] WARNING: remote.IP is empty\n", timestamp)
+			return
+		}
+		if bw == nil {
+			fmt.Printf("%s [DISCONNECT] WARNING: bandwidth stats is nil\n", timestamp)
+			return
+		}
+
+		fmt.Printf("%s [DISCONNECT] Remote IP: %s, Type: %s\n", timestamp, remote.IP, remote.CandidateType)
+		fmt.Printf("%s [DISCONNECT] Bandwidth - Up: %d bytes, Down: %d bytes\n", timestamp, bw.BytesUp, bw.BytesDown)
+
+		// Only track geo for connections that passed the filter
+		if s.geoCollector != nil {
 			if s.countryFilter != nil {
-				allowed, countryCode, isRelay := s.countryFilter.IsAllowed(remote.IP)
+				// Re-check filter to ensure we only track allowed connections
+				allowed, countryCode, _ := s.countryFilter.IsAllowed(remote.IP)
 				if !allowed {
-					if s.config.Verbosity >= 1 {
-						fmt.Printf("[BLOCKED] Connection from %s (%s)\n", remote.IP, countryCode)
-					}
+					fmt.Printf("%s [DISCONNECT] Skipping geo tracking for blocked IP: %s (%s)\n", timestamp, remote.IP, countryCode)
 					return
 				}
-				if s.config.Verbosity >= 2 {
-					if isRelay {
-						fmt.Printf("[ALLOWED] Relay connection from %s\n", remote.IP)
-					} else {
-						fmt.Printf("[ALLOWED] Connection from %s (%s)\n", remote.IP, countryCode)
-					}
-				}
 			}
-
-			// Geo tracking (if enabled)
-			if s.geoCollector != nil {
-				if remote.CandidateType == "relay" {
-					s.geoCollector.ConnectRelay(remote.IP)
-				} else {
-					s.geoCollector.ConnectIP(remote.IP)
-				}
+			if remote.CandidateType == "relay" {
+				s.geoCollector.DisconnectRelay(remote.IP, bw.BytesUp, bw.BytesDown)
+			} else {
+				s.geoCollector.DisconnectIP(remote.IP, bw.BytesUp, bw.BytesDown)
 			}
+			fmt.Printf("%s [DISCONNECT] Geo tracking: recorded disconnect\n", timestamp)
 		}
-		psiphonConfig.OnInproxyConnectionClosed = func(remote *inproxy.ConnectionStats, bw *inproxy.BandwidthStats) {
-			if remote == nil || remote.IP == "" || bw == nil {
-				return
-			}
-			// Only track geo for connections that passed the filter
-			if s.geoCollector != nil {
-				if s.countryFilter != nil {
-					// Re-check filter to ensure we only track allowed connections
-					allowed, _, _ := s.countryFilter.IsAllowed(remote.IP)
-					if !allowed {
-						return
-					}
-				}
-				if remote.CandidateType == "relay" {
-					s.geoCollector.DisconnectRelay(remote.IP, bw.BytesUp, bw.BytesDown)
-				} else {
-					s.geoCollector.DisconnectIP(remote.IP, bw.BytesUp, bw.BytesDown)
-				}
-			}
-		}
+		fmt.Printf("%s [DISCONNECT] ========== CONNECTION CLOSED ==========\n\n", timestamp)
 	}
 
 	return psiphonConfig, nil

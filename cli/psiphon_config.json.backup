@@ -1,6 +1,6 @@
 {
     "DNSResolverCacheExtensionInitialTTLMilliseconds": 60000,
-    "DNSResolverCacheExtensionVerifiedTTLMilliseconds": 86400000,
+    "DNSResolverCcheExtensionVerifiedTTLMilliseconds": 86400000,
     "PropagationChannelId": "EE0B7486ACAE75AA",
     "SponsorId": "9539E4C96435B6E9",
     "EmitDiagnosticNotices": true,
